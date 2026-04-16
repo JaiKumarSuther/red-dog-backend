@@ -11,9 +11,30 @@ const signToken = (id) =>
 
 const register = async (body) => {
   const { fullName, firstName, lastName, email, password } = body;
-  const normalizedEmail = String(email || '').trim().toLowerCase();
-  const existing = await User.findOne({ email: normalizedEmail });
-  if (existing) throw new AppError('Email already registered', 409);
+  const normalizedEmail = String(email || '')
+    .trim()
+    .toLowerCase();
+
+  if (!normalizedEmail) {
+    throw new AppError('Email is required', 400);
+  }
+
+  const existingUser = await User.findOne({ email: normalizedEmail });
+  if (existingUser) {
+    if (existingUser.role === 'admin') {
+      throw new AppError(
+        'This email is already in use for a staff account. Please sign in at /admin/login.',
+        409
+      );
+    }
+    if (existingUser.isVerified) {
+      throw new AppError(
+        'This email is already registered. Please sign in or use forgot password.',
+        409
+      );
+    }
+    await User.deleteOne({ _id: existingUser._id });
+  }
 
   const resolvedFullName = fullName || [firstName, lastName].filter(Boolean).join(' ');
   const resolvedFirst = firstName || (fullName ? fullName.split(' ')[0] : '');
@@ -26,17 +47,25 @@ const register = async (body) => {
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
   const hashedOtp = await bcrypt.hash(otp, 10);
 
-  const user = await User.create({
-    fullName: resolvedFullName,
-    firstName: resolvedFirst,
-    lastName: resolvedLast,
-    email: normalizedEmail,
-    password,
-    role: 'agency',
-    isVerified: false,
-    verificationOtp: hashedOtp,
-    verificationOtpExpiry: new Date(Date.now() + 15 * 60 * 1000),
-  });
+  let user;
+  try {
+    user = await User.create({
+      fullName: resolvedFullName,
+      firstName: resolvedFirst,
+      lastName: resolvedLast,
+      email: normalizedEmail,
+      password,
+      role: 'agency',
+      isVerified: false,
+      verificationOtp: hashedOtp,
+      verificationOtpExpiry: new Date(Date.now() + 15 * 60 * 1000),
+    });
+  } catch (e) {
+    if (e && e.code === 11000) {
+      throw new AppError('This email is already registered. Please sign in.', 409);
+    }
+    throw e;
+  }
 
   try {
     if (process.env.NODE_ENV !== 'production') {
@@ -56,7 +85,7 @@ const register = async (body) => {
       console.error('[auth] Verification email send failed:', result?.error || '(stub/no error provided)');
     }
   } catch (e) {
-    // Do not leak OTP; allow account creation but require resend from client.
+    console.error('[auth] Verification email send error (account still created):', e?.message || e);
   }
 
   return {
@@ -70,19 +99,16 @@ const login = async ({ email, password }) => {
   const normalized = String(email || '').trim().toLowerCase();
   const user = await User.findOne({ email: normalized }).select('+password');
   if (!user || !(await user.comparePassword(password))) {
-    throw new AppError('Invalid email or password', 401);
+    throw new AppError('Incorrect email or password.', 401);
   }
   if (user.role === 'admin') {
     throw new AppError(
-      'Red Dog Radio staff must sign in through the staff portal at /admin/login.',
+      'This email belongs to a staff account. Please use the staff sign-in page at /admin/login.',
       403
     );
   }
   if (!user.isVerified) {
-    throw new AppError(
-      'Please verify your email before logging in. Check your inbox for the verification code.',
-      403
-    );
+    throw new AppError('Please verify your email first.', 403);
   }
   const token = signToken(user._id);
   const safeUser = user.toObject();
@@ -174,13 +200,17 @@ const getMe = async (userId) => {
 };
 
 const loginAdmin = async ({ email, password }) => {
-  const user = await User.findOne({ email }).select('+password');
+  const normalized = String(email || '').trim().toLowerCase();
+  const user = await User.findOne({ email: normalized }).select('+password');
   if (!user || !(await user.comparePassword(password))) {
-    throw new AppError('Invalid email or password', 401);
+    throw new AppError(
+      "We couldn't sign you in. Check your email and password for typos.",
+      401
+    );
   }
   if (user.role !== 'admin') {
     throw new AppError(
-      'Agency members should use the main login page. This portal is for Red Dog Radio staff only.',
+      'This portal is for Red Dog Radio staff only. Agency members should use the main sign-in page at /login.',
       403
     );
   }
