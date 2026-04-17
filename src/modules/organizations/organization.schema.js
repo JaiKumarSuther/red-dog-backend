@@ -23,11 +23,7 @@ const organizationSchema = new mongoose.Schema(
     agencyTypes: [
       {
         type: String,
-        enum: [
-          'law_enforcement', 'fire_services', 'ems', 'emergency_management',
-          '911_centers', 'hospitals', 'public_safety_comms', 'multi_agency', 'utilities',
-          'business',
-        ],
+        trim: true,
       },
     ],
     programAreas: [{ type: String }],
