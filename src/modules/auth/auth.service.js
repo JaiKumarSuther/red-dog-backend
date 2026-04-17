@@ -3,7 +3,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('./user.schema');
 const { AppError } = require('../../middlewares/error.middleware');
-
 const { sendOtpEmail } = require('../../config/email.config');
 
 const signToken = (id) =>
@@ -179,15 +178,19 @@ const resendVerificationOtp = async ({ email }) => {
     console.log('[auth] Resending verification OTP to:', normalized);
   }
 
-  const result = await sendOtpEmail({
-    to: normalized,
-    otp,
-    name: user.fullName || user.firstName || '',
-    type: 'signup',
-  });
-
-  if (!result?.success) {
-    console.error('[auth] Resend verification email failed:', result?.error || '(stub/no error provided)');
+  try {
+    const result = await sendOtpEmail({
+      to: normalized,
+      otp,
+      name: user.fullName || user.firstName || '',
+      type: 'signup',
+    });
+    if (!result?.success) {
+      console.error('[resendVerification] Email failed:', result?.error || '(stub/no error provided)');
+    }
+  } catch (emailErr) {
+    console.error('[resendVerification] Email error:', emailErr.message);
+    // Non-fatal — OTP saved, user can try again
   }
 
   return { success: true, message: 'New verification code sent to your email.' };
@@ -221,78 +224,138 @@ const loginAdmin = async ({ email, password }) => {
 };
 
 const forgotPassword = async ({ email }) => {
-  const normalized = String(email || '')
-    .trim()
-    .toLowerCase();
-  const generic = { ok: true, message: 'If an account exists for this email, a reset code was sent.' };
-  if (!normalized) return generic;
+  const normalizedEmail = email?.toLowerCase()?.trim();
+  if (!normalizedEmail) throw new AppError('Email is required', 400);
 
-  const user = await User.findOne({ email: normalized });
-  if (!user) return generic;
+  const user = await User.findOne({ email: normalizedEmail });
+  console.log('[forgotPassword] Email:', normalizedEmail, '| Found:', user ? 'YES' : 'NO');
 
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  user.resetOtp = await bcrypt.hash(otp, 10);
+  if (!user) {
+    throw new AppError('No account found with this email. Please sign up first.', 404);
+  }
+
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const hashedOtp = await bcrypt.hash(otp, 10);
+
+  user.resetOtp = hashedOtp;
   user.resetOtpExpiry = new Date(Date.now() + 15 * 60 * 1000);
   user.resetToken = undefined;
   user.resetTokenExpiry = undefined;
   await user.save();
 
-  try {
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('[DEBUG] Sending RESET OTP email to:', user.email, 'OTP:', otp);
-    }
-
-    await sendOtpEmail({
-      to: user.email,
-      otp,
-      name: user.fullName || user.firstName || 'there',
-      type: 'reset',
-    });
-  } catch (e) {
-    console.error('[auth] Forgot password email failed:', e.message);
+  console.log('[forgotPassword] OTP generated for:', normalizedEmail);
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[DEBUG forgotPassword] OTP for', normalizedEmail, ':', otp);
   }
 
-  return generic;
+  try {
+    const result = await sendOtpEmail({
+      to: normalizedEmail,
+      otp,
+      name: user.firstName || user.fullName || 'there',
+      type: 'reset',
+    });
+    console.log('[forgotPassword] Email result:', result);
+  } catch (emailErr) {
+    console.error('[forgotPassword] Email failed:', emailErr.message);
+    // Non-fatal — OTP is saved, user can request resend
+  }
+
+  return {
+    message: 'If that email exists, a reset code has been sent.',
+    email: normalizedEmail,
+  };
 };
 
 const verifyOtp = async ({ email, otp }) => {
-  const normalized = String(email || '')
-    .trim()
-    .toLowerCase();
-  const user = await User.findOne({ email: normalized }).select('+resetOtp +resetOtpExpiry');
-  if (!user?.resetOtp || !user.resetOtpExpiry) throw new AppError('Invalid or expired code', 400);
-  if (user.resetOtpExpiry < new Date()) throw new AppError('Invalid or expired code', 400);
-  const ok = await bcrypt.compare(String(otp).trim(), user.resetOtp);
-  if (!ok) throw new AppError('Invalid or expired code', 400);
+  const normalizedEmail = email?.toLowerCase()?.trim();
+  if (!normalizedEmail || !otp) {
+    throw new AppError('Email and OTP are required', 400);
+  }
 
+  const user = await User.findOne({ email: normalizedEmail }).select('+resetOtp +resetOtpExpiry');
+
+  if (!user) throw new AppError('Invalid or expired code', 400);
+
+  if (!user.resetOtp || !user.resetOtpExpiry) {
+    throw new AppError('No reset code found. Request a new one.', 400);
+  }
+
+  if (new Date() > user.resetOtpExpiry) {
+    throw new AppError('Reset code has expired. Request a new one.', 400);
+  }
+
+  const isMatch = await bcrypt.compare(String(otp).trim(), user.resetOtp);
+  if (!isMatch) throw new AppError('Invalid reset code', 400);
+
+  // Generate reset token
   const resetToken = crypto.randomBytes(32).toString('hex');
-  user.resetToken = await bcrypt.hash(resetToken, 10);
-  user.resetTokenExpiry = new Date(Date.now() + 60 * 60 * 1000);
+  const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+
+  user.resetToken = hashedToken;
+  user.resetTokenExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
   user.resetOtp = undefined;
   user.resetOtpExpiry = undefined;
   await user.save();
 
-  return { resetToken };
+  return {
+    resetToken,
+    email: normalizedEmail,
+    message: 'OTP verified. You can now reset your password.',
+  };
 };
 
 const resetPassword = async ({ email, resetToken, newPassword }) => {
-  if (!newPassword || String(newPassword).length < 8) {
+  if (!email || !resetToken || !newPassword) {
+    throw new AppError('All fields are required', 400);
+  }
+  if (String(newPassword).length < 8) {
     throw new AppError('Password must be at least 8 characters', 400);
   }
-  const normalized = String(email || '')
-    .trim()
-    .toLowerCase();
-  const user = await User.findOne({ email: normalized }).select('+password +resetToken +resetTokenExpiry');
-  if (!user?.resetToken || !user.resetTokenExpiry) throw new AppError('Invalid or expired reset link', 400);
-  if (user.resetTokenExpiry < new Date()) throw new AppError('Invalid or expired reset link', 400);
-  const ok = await bcrypt.compare(String(resetToken).trim(), user.resetToken);
-  if (!ok) throw new AppError('Invalid or expired reset link', 400);
 
-  user.password = newPassword;
-  user.resetToken = undefined;
-  user.resetTokenExpiry = undefined;
-  await user.save();
-  return { ok: true };
+  const normalizedEmail = email?.toLowerCase()?.trim();
+  const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+
+  const user = await User.findOne({ email: normalizedEmail })
+    .select('+resetToken +resetTokenExpiry');
+
+  console.log('[resetPassword] Looking for user:', normalizedEmail);
+  console.log('[resetPassword] User found:', user ? 'YES' : 'NO');
+
+  if (!user) {
+    throw new AppError('Invalid or expired reset link. Request a new one.', 400);
+  }
+
+  if (!user.resetToken) {
+    throw new AppError('No reset session found. Please request a new code.', 400);
+  }
+
+  const tokenMatches = user.resetToken === hashedToken;
+  console.log('[resetPassword] Token matches:', tokenMatches);
+
+  if (!tokenMatches) {
+    throw new AppError('Invalid reset token. Please request a new code.', 400);
+  }
+
+  if (user.resetTokenExpiry && new Date() > user.resetTokenExpiry) {
+    throw new AppError('Reset link has expired. Please request a new code.', 400);
+  }
+
+  // Hash manually and use findByIdAndUpdate to bypass the pre-save hook,
+  // which would otherwise hash an already-hashed password a second time.
+  const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+  await User.findByIdAndUpdate(user._id, {
+    password: hashedPassword,
+    resetToken: undefined,
+    resetTokenExpiry: undefined,
+    resetOtp: undefined,
+    resetOtpExpiry: undefined,
+  });
+
+  console.log('[resetPassword] Password updated successfully for:', normalizedEmail);
+
+  return { message: 'Password reset successfully. You can now sign in.' };
 };
 
 module.exports = {
